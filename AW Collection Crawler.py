@@ -1,43 +1,65 @@
 import requests
 import json
-import re
 import os
 from urllib.parse import urlparse, urlunparse
 
-# URL template with {username} as a placeholder
-URL_TEMPLATE = "http://api-magicframe.automusic.win/collection/list/{username}/company/null/1/20/{page}/null"
+# Updated URL template
+URL_TEMPLATE = "http://api-magicframe.automusic.win/collection/list/{username}/company,{username}/null/1/20/{page}/null"
 
-def extract_urls_from_json(json_data):
+def extract_urls_from_json(json_data, page_num):
     """
-    Extract all URLs from the JSON data.
-    Returns a list of URLs found in the 'poster' fields.
+    Extract all URLs and collection names from the JSON data.
+    Returns a list of tuples containing (collection_name, url) found in the 'poster' fields.
     """
-    url_list = []
+    result = []
     
     try:
         data = json.loads(json_data)
         
-        # Iterate through each entry in the JSON array
+        if isinstance(data, dict):
+            for key in data:
+                if isinstance(data[key], list):
+                    data = data[key]
+                    break
+            else:
+                return result
+        
+        if not isinstance(data, list):
+            return result
+        
         for entry in data:
-            # Get the 'data' field which contains the JSON string with resources
+            if not isinstance(entry, dict):
+                continue
+                
+            collection_name = entry.get('name', 'Unnamed Collection')
             resources_str = entry.get('data', '')
             
-            # Parse the nested JSON string in 'data'
-            resources = json.loads(resources_str)
+            if not resources_str:
+                continue
             
-            # Extract URLs from the 'data' array within the nested JSON
-            for resource in resources.get('data', []):
+            try:
+                resources = json.loads(resources_str)
+                if not isinstance(resources, dict):
+                    continue
+            except json.JSONDecodeError:
+                continue
+            
+            resource_list = resources.get('data', [])
+            if not isinstance(resource_list, list):
+                continue
+                
+            for resource in resource_list:
+                if not isinstance(resource, dict):
+                    continue
                 poster_url = resource.get('poster', '')
                 if poster_url:
-                    url_list.append(poster_url)
+                    result.append((collection_name, poster_url))
                     
-        return url_list
+        return result
     
-    except json.JSONDecodeError as e:
-        print(f"Error parsing JSON: {e}")
+    except json.JSONDecodeError:
         return []
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    except Exception:
         return []
 
 def estimate_total_pages(base_url):
@@ -46,34 +68,32 @@ def estimate_total_pages(base_url):
     """
     page = 1
     while True:
-        # Construct URL for the current page
         current_url = base_url.format(page=page)
         try:
             response = requests.get(current_url)
             response.raise_for_status()
             data = json.loads(response.text)
             
-            if not data:  # Empty response means no more pages
+            if not data or (isinstance(data, list) and len(data) == 0):
                 return page - 1
             
             page += 1
         except requests.RequestException:
-            return page - 1  # Return last valid page if request fails
+            return page - 1
 
 def fetch_and_extract_all_urls(username):
     """
-    Fetch and extract unique URLs from all pages for a given username.
+    Fetch and extract unique URLs with their collection names from all pages for a given username.
     """
-    all_urls = set()  # Use a set to automatically remove duplicates
+    all_data = []
     
-    # Construct base URL for page 1
     base_url = URL_TEMPLATE.replace("{username}", username)
-    
-    # Get total number of pages
     total_pages = estimate_total_pages(base_url)
+    if total_pages < 1:
+        total_pages = 1
+    
     print(f"Detected {total_pages} pages to crawl for user '{username}'.\n")
     
-    # Fetch each page and extract URLs
     for page in range(1, total_pages + 1):
         current_url = base_url.format(page=page)
         print(f"Fetching page {page}")
@@ -82,33 +102,34 @@ def fetch_and_extract_all_urls(username):
             response = requests.get(current_url)
             response.raise_for_status()
             
-            # Extract URLs from this page and add to set
-            page_urls = extract_urls_from_json(response.text)
-            all_urls.update(page_urls)  # Add URLs to set (duplicates are ignored)
-            print(f"Found {len(page_urls)} URLs on page {page}\n")
+            page_data = extract_urls_from_json(response.text, page)
+            all_data.extend(page_data)
+            print(f"Found {len(page_data)} URLs on page {page}\n")
             
         except requests.RequestException as e:
             print(f"Error fetching page {page}: {e}")
-        except Exception as e:
-            print(f"An error occurred on page {page}: {e}\n")
     
-    return list(all_urls)  # Convert set back to list for output
+    return all_data
 
 def main():
     while True:
-        # Get username from user input
         username = input("Please enter the username: ")
+        data = fetch_and_extract_all_urls(username)
         
-        # Fetch and extract unique URLs from all pages for the given username
-        urls = fetch_and_extract_all_urls(username)
+        collections = {}
+        for collection_name, url in data:
+            if collection_name not in collections:
+                collections[collection_name] = set()
+            collections[collection_name].add(url)
         
-        # Print all found URLs
-        print(f"\nTotal unique URLs found across all pages for user '{username}': {len(urls)}")
-        for i, url in enumerate(urls, 1):
-            print(f"{i}. {url}")
+        total_urls = sum(len(urls) for urls in collections.values())
+        print(f"\nTotal unique URLs found across all pages for user '{username}': {total_urls}")
+        for collection_name, urls in collections.items():
+            print(f"\nCollection Name: {collection_name}")
+            for i, url in enumerate(sorted(urls), 1):
+                print(f"{i}. {url}")
         
-        # Optionally save to file
-        if urls:
+        if data:
             save_to_file = input("Would you like to save the URLs to a file? (y/n): ").lower()
             if save_to_file == 'y':
                 while True:
@@ -121,11 +142,13 @@ def main():
                 if directory and not os.path.exists(directory):
                     os.makedirs(directory)
                 with open(filename, 'w', encoding='utf-8') as f:
-                    for url in urls:
-                        f.write(url + '\n')
+                    for collection_name, urls in collections.items():
+                        f.write(f"Collection Name: {collection_name}\n")
+                        for url in sorted(urls):
+                            f.write(url + '\n')
+                        f.write('\n')
                 print(f"URLs saved to {filename}")
         
-        # Ask if the user wants to rerun
         rerun = input("\nWould you like to run the script again? (y/n): ").lower()
         if rerun != 'y':
             print("Exiting script.")
